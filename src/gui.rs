@@ -1,4 +1,4 @@
-use eframe::{egui, App, Frame};
+use eframe::{App, Frame, egui};
 use egui_plot::{Legend, Line, Plot, PlotPoints, PlotUi};
 
 pub struct BenchmarkData {
@@ -64,7 +64,7 @@ impl BenchmarkApp {
     }
 
     fn add_gcd_lines(&self, plot_ui: &mut PlotUi) {
-        let native_points: Vec<_> = self
+        let native_points: Vec<[f64; 2]> = self
             .data
             .bits
             .iter()
@@ -72,7 +72,7 @@ impl BenchmarkApp {
             .map(|(&x, &y)| [x as f64, y as f64])
             .collect();
 
-        let pfs_points: Vec<_> = self
+        let pfs_points: Vec<[f64; 2]> = self
             .data
             .bits
             .iter()
@@ -80,21 +80,25 @@ impl BenchmarkApp {
             .map(|(&x, &y)| [x as f64, y as f64])
             .collect();
 
-        // Korrigierte Syntax:
-        let native_line = Line::new(PlotPoints::from(native_points))
-            .name("Native GCD")
-            .color(egui::Color32::RED);
+        // Korrigiert: Zwei Argumente für Line::new()
+        let native_line = Line::new(
+            "Native GCD",                    // Name als erstes Argument
+            PlotPoints::from(native_points), // Daten als zweites Argument
+        )
+        .color(egui::Color32::RED);
 
-        let pfs_line = Line::new(PlotPoints::from(pfs_points))
-            .name("PFS GCD")
-            .color(egui::Color32::GREEN);
+        let pfs_line = Line::new(
+            "PFS GCD",                    // Name als erstes Argument
+            PlotPoints::from(pfs_points), // Daten als zweites Argument
+        )
+        .color(egui::Color32::GREEN);
 
         plot_ui.line(native_line);
         plot_ui.line(pfs_line);
     }
 
     fn add_lcm_lines(&self, plot_ui: &mut PlotUi) {
-        let native_points: Vec<_> = self
+        let native_points: Vec<[f64; 2]> = self
             .data
             .bits
             .iter()
@@ -102,7 +106,7 @@ impl BenchmarkApp {
             .map(|(&x, &y)| [x as f64, y as f64])
             .collect();
 
-        let pfs_points: Vec<_> = self
+        let pfs_points: Vec<[f64; 2]> = self
             .data
             .bits
             .iter()
@@ -110,14 +114,18 @@ impl BenchmarkApp {
             .map(|(&x, &y)| [x as f64, y as f64])
             .collect();
 
-        // Korrigierte Syntax:
-        let native_line = Line::new(PlotPoints::from(native_points))
-            .name("Native LCM")
-            .color(egui::Color32::BLUE);
+        // Korrigiert: Zwei Argumente für Line::new()
+        let native_line = Line::new(
+            "Native LCM",                    // Name als erstes Argument
+            PlotPoints::from(native_points), // Daten als zweites Argument
+        )
+        .color(egui::Color32::BLUE);
 
-        let pfs_line = Line::new(PlotPoints::from(pfs_points))
-            .name("PFS LCM")
-            .color(egui::Color32::YELLOW);
+        let pfs_line = Line::new(
+            "PFS LCM",                    // Name als erstes Argument
+            PlotPoints::from(pfs_points), // Daten als zweites Argument
+        )
+        .color(egui::Color32::YELLOW);
 
         plot_ui.line(native_line);
         plot_ui.line(pfs_line);

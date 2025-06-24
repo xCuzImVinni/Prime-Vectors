@@ -55,22 +55,28 @@ fn reconstruct_array(exps: &[u8; K], primes: &[u32], leftover: u32) -> u64 {
 }
 
 unsafe fn simd_min(a: *const u8, b: *const u8, out: *mut u8) {
-    let va = _mm_loadu_si128(a as *const __m128i);
-    let vb = _mm_loadu_si128(b as *const __m128i);
-    let vc = _mm_min_epu8(va, vb);
-    _mm_storeu_si128(out as *mut __m128i, vc);
+    unsafe {
+        let va = _mm_loadu_si128(a as *const __m128i);
+        let vb = _mm_loadu_si128(b as *const __m128i);
+        let vc = _mm_min_epu8(va, vb);
+        _mm_storeu_si128(out as *mut __m128i, vc);
+    }
 }
 unsafe fn simd_add(a: *const u8, b: *const u8, out: *mut u8) {
-    let va = _mm_loadu_si128(a as *const __m128i);
-    let vb = _mm_loadu_si128(b as *const __m128i);
-    let vc = _mm_add_epi8(va, vb);
-    _mm_storeu_si128(out as *mut __m128i, vc);
+    unsafe {
+        let va = _mm_loadu_si128(a as *const __m128i);
+        let vb = _mm_loadu_si128(b as *const __m128i);
+        let vc = _mm_add_epi8(va, vb);
+        _mm_storeu_si128(out as *mut __m128i, vc);
+    }
 }
 unsafe fn simd_sub(a: *const u8, b: *const u8, out: *mut u8) {
-    let va = _mm_loadu_si128(a as *const __m128i);
-    let vb = _mm_loadu_si128(b as *const __m128i);
-    let vc = _mm_sub_epi8(va, vb);
-    _mm_storeu_si128(out as *mut __m128i, vc);
+    unsafe {
+        let va = _mm_loadu_si128(a as *const __m128i);
+        let vb = _mm_loadu_si128(b as *const __m128i);
+        let vc = _mm_sub_epi8(va, vb);
+        _mm_storeu_si128(out as *mut __m128i, vc);
+    }
 }
 
 fn gcd_euclid(mut a: u32, mut b: u32) -> u32 {
@@ -152,8 +158,9 @@ fn main() -> Result<(), eframe::Error> {
         };
 
         for _ in 0..TRIALS {
-            let raw_a = rng.gen::<u64>() & mask;
-            let raw_b = rng.gen::<u64>() & mask;
+            // ✅ Korrekte Verwendung von rng.gen::<u64>()
+            let raw_a: u64 = rng.gen::<u64>() & mask;
+            let raw_b: u64 = rng.gen::<u64>() & mask;
             let a = raw_a.min(u32::MAX as u64) as u32;
             let b = raw_b.min(u32::MAX as u64) as u32;
 
@@ -192,7 +199,6 @@ fn main() -> Result<(), eframe::Error> {
         let avg_native_lcm = native_lcm_total.as_nanos() / TRIALS as u128;
         let avg_pfs_lcm = pfs_lcm_total.as_nanos() / TRIALS as u128;
 
-        // Daten für CSV speichern
         writeln!(
             file,
             "{},{},{},{},{}",
@@ -200,7 +206,6 @@ fn main() -> Result<(), eframe::Error> {
         )
         .unwrap();
 
-        // Daten für GUI sammeln
         bits_vec.push(bits as u32);
         native_gcd_vec.push(avg_native_gcd);
         pfs_gcd_vec.push(avg_pfs_gcd);
@@ -211,7 +216,7 @@ fn main() -> Result<(), eframe::Error> {
             "Bits: {}\tGCD native: {} ns\tPFS: {} ns\tLCM native: {} ns\tPFS: {} ns",
             bits, avg_native_gcd, avg_pfs_gcd, avg_native_lcm, avg_pfs_lcm
         );
-    }
+    } // 👈 diese Klammer hat bei dir gefehlt!
 
     println!("Done. Output written to benchmark_output.csv");
 
