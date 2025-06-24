@@ -10,11 +10,24 @@ use gui::{BenchmarkData, run_benchmark_gui};
 
 const K: usize = 16;
 const TRIALS: usize = 1000;
-const MAX_LUT: usize = 1 << 16;
+const MAX_LUT: usize = 1 << 18; // 256 KiB Einträge (2 MB bei 17bit, 8 MB bei 19bit)
 
 static PRIMES: OnceLock<Vec<u32>> = OnceLock::new();
 static FACTOR_LUT: OnceLock<Box<[([u8; K], u32); MAX_LUT]>> = OnceLock::new();
-static POWER_TABLE: OnceLock<Vec<Vec<u64>>> = OnceLock::new();
+static POWER_TABLE: OnceLock<[[u64; 64]; K]> = OnceLock::new();
+
+fn init_power_table() -> [[u64; 64]; K] {
+    let primes = PRIMES.get().unwrap();
+    let mut table = [[1u64; 64]; K];
+    for i in 0..K {
+        let mut acc = 1u64;
+        for e in 1..64 {
+            acc = acc.saturating_mul(primes[i] as u64);
+            table[i][e] = acc;
+        }
+    }
+    table
+}
 
 fn binary_gcd(mut a: u64, mut b: u64) -> u64 {
     if a == 0 {
@@ -76,75 +89,37 @@ fn init_lookup_table() -> Box<[([u8; K], u32); MAX_LUT]> {
     table
 }
 
-fn init_power_table() -> Vec<Vec<u64>> {
-    let primes = PRIMES.get().expect("PRIMES not initialized");
-    primes
-        .iter()
-        .map(|&p| {
-            let mut row = vec![1u64; 64];
-            for i in 1..64 {
-                row[i] = row[i - 1].saturating_mul(p as u64);
-            }
-            row
-        })
-        .collect()
-}
-
-fn factorize_32bit(n: u32) -> ([u8; K], u32) {
-    let lut = FACTOR_LUT.get().unwrap();
-    let low = (n & 0xFFFF) as usize;
-    let high = (n >> 16) as usize;
-
-    let (low_factors, low_rem) = lut[low];
-    let (high_factors, high_rem) = if high == 0 { ([0u8; K], 1) } else { lut[high] };
-
-    let mut combined = [0u8; K];
-    for i in 0..K {
-        combined[i] = low_factors[i] + high_factors[i];
-    }
-    (combined, low_rem.saturating_mul(high_rem))
-}
-
-fn fast_factorize(mut n: u64) -> ([u8; K], u64) {
-    let primes = PRIMES.get().unwrap();
-    let mut exponents = [0u8; K];
-    for (i, &p) in primes.iter().enumerate() {
-        let p64 = p as u64;
-        if p64 * p64 > n {
-            break;
-        }
-        while n % p64 == 0 {
-            exponents[i] += 1;
-            n /= p64;
-        }
-    }
-    (exponents, n)
-}
-
+#[inline(always)]
 fn factorize(n: u64) -> ([u8; K], u64) {
     if n < MAX_LUT as u64 {
-        let (f, r) = factorize_32bit(n as u32);
+        let (f, r) = FACTOR_LUT.get().unwrap()[n as usize];
         (f, r as u64)
     } else {
-        fast_factorize(n)
+        let primes = PRIMES.get().unwrap();
+        let mut exponents = [0u8; K];
+        let mut rem = n;
+        for (i, &p) in primes.iter().enumerate() {
+            let p64 = p as u64;
+            if p64 * p64 > rem {
+                break;
+            }
+            while rem % p64 == 0 {
+                exponents[i] += 1;
+                rem /= p64;
+            }
+        }
+        (exponents, rem)
     }
 }
 
+#[inline(always)]
 fn pfs_to_u64(factors: &[u8; K]) -> u64 {
-    POWER_TABLE
-        .get_or_init(init_power_table)
-        .iter()
-        .enumerate()
-        .map(|(i, row)| row[factors[i] as usize])
-        .product()
-}
-
-fn simd_min(a: &[u8; K], b: &[u8; K]) -> [u8; K] {
-    (u8x16::from_array(*a).simd_min(u8x16::from_array(*b))).to_array()
-}
-
-fn simd_max(a: &[u8; K], b: &[u8; K]) -> [u8; K] {
-    (u8x16::from_array(*a).simd_max(u8x16::from_array(*b))).to_array()
+    let power_table = POWER_TABLE.get().unwrap();
+    let mut result = 1u64;
+    for i in 0..K {
+        result = result.saturating_mul(power_table[i][factors[i] as usize]);
+    }
+    result
 }
 
 fn main() {
@@ -174,20 +149,31 @@ fn main() {
             let g1 = binary_gcd(x, y);
             native_gcd_time += now.elapsed().as_nanos();
 
+            // --- PFS GCD ---
             let now = Instant::now();
             let (xf, xr) = factorize(x);
             let (yf, yr) = factorize(y);
             let gcd_rem = binary_gcd(xr, yr);
-            let g2 = pfs_to_u64(&simd_min(&xf, &yf)).saturating_mul(gcd_rem);
+
+            // SIMD min statt Schleife
+            let f_min = u8x16::from_array(xf)
+                .simd_min(u8x16::from_array(yf))
+                .to_array();
+            let g2 = pfs_to_u64(&f_min).saturating_mul(gcd_rem);
             pfs_gcd_time += now.elapsed().as_nanos();
 
+            // --- Native LCM ---
             let now = Instant::now();
             let l1 = native_lcm(x, y);
             native_lcm_time += now.elapsed().as_nanos();
 
+            // --- PFS LCM ---
             let now = Instant::now();
-            let lcm_rem = native_lcm(xr, yr);
-            let l2 = pfs_to_u64(&simd_max(&xf, &yf)).saturating_mul(lcm_rem);
+            let lcm_rem = native_lcm(xr, yr); // nicht doppelt aufrufen!
+            let f_max = u8x16::from_array(xf)
+                .simd_max(u8x16::from_array(yf))
+                .to_array();
+            let l2 = pfs_to_u64(&f_max).saturating_mul(lcm_rem);
             pfs_lcm_time += now.elapsed().as_nanos();
 
             debug_assert_eq!(
@@ -219,5 +205,5 @@ fn main() {
         pfs_lcm_ns,
     };
 
-    let _ = run_benchmark_gui(data); // Result ignorieren wegen Warnung
+    let _ = run_benchmark_gui(data);
 }
