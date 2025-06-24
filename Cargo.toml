@@ -1,0 +1,14 @@
+[package]
+name = "math-functions"
+version = "0.1.0"
+authors = ["Your Name <you@example.com>"]
+edition = "2021"
+[dependencies]
+csv = "1.3.1"
+eframe = "0.31.1"
+egui = "0.31.1"
+egui_plot = "0.32.1"
+rand = "0.8"
+[[bin]]
+name = "gui"
+path = "src/gui.rs"
