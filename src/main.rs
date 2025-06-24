@@ -1,249 +1,223 @@
-//PFS := Prime Factorization System, native := the usual way
+#![feature(portable_simd)]
+
 use rand::Rng;
-use std::arch::x86_64::*;
-use std::fs::File;
-use std::io::Write;
+use std::simd::{cmp::SimdOrd, u8x16};
 use std::sync::OnceLock;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 mod gui;
 use gui::{BenchmarkData, run_benchmark_gui};
 
-const K: usize = 20; // Erhöht auf 20 Primzahlen
+const K: usize = 16;
 const TRIALS: usize = 1000;
-const MAX_LUT: usize = 1 << 16; // 65536
+const MAX_LUT: usize = 1 << 16;
 
-static FACTOR_LUT: OnceLock<Vec<([u8; K], u32)>> = OnceLock::new();
+static PRIMES: OnceLock<Vec<u32>> = OnceLock::new();
+static FACTOR_LUT: OnceLock<Box<[([u8; K], u32); MAX_LUT]>> = OnceLock::new();
+static POWER_TABLE: OnceLock<Vec<Vec<u64>>> = OnceLock::new();
+
+fn binary_gcd(mut a: u64, mut b: u64) -> u64 {
+    if a == 0 {
+        return b;
+    }
+    if b == 0 {
+        return a;
+    }
+    let shift = a.trailing_zeros().min(b.trailing_zeros());
+    a >>= a.trailing_zeros();
+    b >>= b.trailing_zeros();
+    while a != b {
+        if a > b {
+            a -= b;
+            a >>= a.trailing_zeros();
+        } else {
+            b -= a;
+            b >>= b.trailing_zeros();
+        }
+    }
+    a << shift
+}
+
+fn native_lcm(a: u64, b: u64) -> u64 {
+    a / binary_gcd(a, b) * b
+}
 
 fn first_k_primes(k: usize) -> Vec<u32> {
-    let mut primes = Vec::new();
-    let mut num = 2;
+    let mut primes = Vec::with_capacity(k);
+    let mut candidate = 2;
     while primes.len() < k {
-        let mut is_prime = true;
-        for &p in &primes {
-            if (p as usize).pow(2) > num {
-                break;
-            }
-            if num % p as usize == 0 {
-                is_prime = false;
-                break;
-            }
+        if primes
+            .iter()
+            .take_while(|&&p| p * p <= candidate)
+            .all(|&p| candidate % p != 0)
+        {
+            primes.push(candidate);
         }
-        if is_prime {
-            primes.push(num as u32);
-        }
-        num += 1;
+        candidate += 1;
     }
     primes
 }
 
-fn init_lookup_table(primes: &[u32]) {
-    let mut table = vec![([0u8; K], 0); MAX_LUT];
-    for n in 1..MAX_LUT {
-        let mut leftover = n as u32;
-        let mut exps = [0u8; K];
-
-        for (i, &p) in primes.iter().enumerate() {
-            while leftover % p == 0 {
-                exps[i] = exps[i].saturating_add(1);
-                leftover /= p;
+fn init_lookup_table() -> Box<[([u8; K], u32); MAX_LUT]> {
+    let primes = PRIMES.get().expect("PRIMES not initialized");
+    let mut table = Box::new([([0u8; K], 1); MAX_LUT]);
+    for i in 2..MAX_LUT {
+        let mut n = i as u64;
+        let mut factor_counts = [0u8; K];
+        for (j, &p) in primes.iter().enumerate() {
+            let p64 = p as u64;
+            while n % p64 == 0 {
+                factor_counts[j] += 1;
+                n /= p64;
             }
         }
-        table[n] = (exps, leftover);
+        table[i] = (factor_counts, n as u32);
     }
-    FACTOR_LUT.set(table).unwrap();
+    table
 }
 
-fn factor_to_array(n: u32, primes: &[u32], exps: &mut [u8; K]) -> u32 {
-    if n < MAX_LUT as u32 {
-        let table = FACTOR_LUT.get().expect("LUT not initialized");
-        let (lookup_exp, leftover) = table[n as usize];
-        *exps = lookup_exp;
-        leftover
-    } else {
-        exps.iter_mut().for_each(|e| *e = 0);
-        let mut leftover = n;
-
-        // Faktorisierung für Primzahlen <= sqrt(n)
-        for (i, &p) in primes.iter().enumerate() {
-            if p * p > leftover {
-                break;
+fn init_power_table() -> Vec<Vec<u64>> {
+    let primes = PRIMES.get().expect("PRIMES not initialized");
+    primes
+        .iter()
+        .map(|&p| {
+            let mut row = vec![1u64; 64];
+            for i in 1..64 {
+                row[i] = row[i - 1].saturating_mul(p as u64);
             }
-            while leftover % p == 0 {
-                exps[i] = exps[i].saturating_add(1);
-                leftover /= p;
-            }
-        }
-
-        // Nachbearbeitung für große Primfaktoren
-        if leftover > 1 {
-            if let Some(pos) = primes.iter().position(|&prime| prime == leftover) {
-                exps[pos] = exps[pos].saturating_add(1);
-                leftover = 1;
-            }
-        }
-
-        leftover
-    }
+            row
+        })
+        .collect()
 }
 
-fn reconstruct_array(exps: &[u8; K], primes: &[u32], leftover: u32) -> u64 {
-    let mut res = leftover as u64;
+fn factorize_32bit(n: u32) -> ([u8; K], u32) {
+    let lut = FACTOR_LUT.get().unwrap();
+    let low = (n & 0xFFFF) as usize;
+    let high = (n >> 16) as usize;
+
+    let (low_factors, low_rem) = lut[low];
+    let (high_factors, high_rem) = if high == 0 { ([0u8; K], 1) } else { lut[high] };
+
+    let mut combined = [0u8; K];
     for i in 0..K {
-        if exps[i] > 0 {
-            let p = primes[i] as u64;
-            res *= p.pow(exps[i] as u32);
+        combined[i] = low_factors[i] + high_factors[i];
+    }
+    (combined, low_rem.saturating_mul(high_rem))
+}
+
+fn fast_factorize(mut n: u64) -> ([u8; K], u64) {
+    let primes = PRIMES.get().unwrap();
+    let mut exponents = [0u8; K];
+    for (i, &p) in primes.iter().enumerate() {
+        let p64 = p as u64;
+        if p64 * p64 > n {
+            break;
+        }
+        while n % p64 == 0 {
+            exponents[i] += 1;
+            n /= p64;
         }
     }
-    res
+    (exponents, n)
 }
 
-fn simd_min(a: *const u8, b: *const u8, out: *mut u8) {
-    unsafe {
-        let va = _mm_loadu_si128(a as *const __m128i);
-        let vb = _mm_loadu_si128(b as *const __m128i);
-        let vc = _mm_min_epu8(va, vb);
-        _mm_storeu_si128(out as *mut __m128i, vc);
+fn factorize(n: u64) -> ([u8; K], u64) {
+    if n < MAX_LUT as u64 {
+        let (f, r) = factorize_32bit(n as u32);
+        (f, r as u64)
+    } else {
+        fast_factorize(n)
     }
 }
 
-fn simd_add(a: *const u8, b: *const u8, out: *mut u8) {
-    unsafe {
-        let va = _mm_loadu_si128(a as *const __m128i);
-        let vb = _mm_loadu_si128(b as *const __m128i);
-        let vc = _mm_add_epi8(va, vb);
-        _mm_storeu_si128(out as *mut __m128i, vc);
-    }
+fn pfs_to_u64(factors: &[u8; K]) -> u64 {
+    POWER_TABLE
+        .get_or_init(init_power_table)
+        .iter()
+        .enumerate()
+        .map(|(i, row)| row[factors[i] as usize])
+        .product()
 }
 
-fn simd_sub(a: *const u8, b: *const u8, out: *mut u8) {
-    unsafe {
-        let va = _mm_loadu_si128(a as *const __m128i);
-        let vb = _mm_loadu_si128(b as *const __m128i);
-        let vc = _mm_sub_epi8(va, vb);
-        _mm_storeu_si128(out as *mut __m128i, vc);
-    }
+fn simd_min(a: &[u8; K], b: &[u8; K]) -> [u8; K] {
+    (u8x16::from_array(*a).simd_min(u8x16::from_array(*b))).to_array()
 }
 
-fn gcd_euclid(mut a: u32, mut b: u32) -> u32 {
-    while b != 0 {
-        (a, b) = (b, a % b);
-    }
-    a
+fn simd_max(a: &[u8; K], b: &[u8; K]) -> [u8; K] {
+    (u8x16::from_array(*a).simd_max(u8x16::from_array(*b))).to_array()
 }
 
-fn main() -> Result<(), eframe::Error> {
-    let primes = first_k_primes(K);
-    init_lookup_table(&primes);
+fn main() {
+    PRIMES.set(first_k_primes(K)).unwrap();
+    FACTOR_LUT.get_or_init(init_lookup_table);
+    POWER_TABLE.get_or_init(init_power_table);
     let mut rng = rand::thread_rng();
-    let mut exp_a = [0u8; K];
-    let mut exp_b = [0u8; K];
-    let mut exp_g = [0u8; K];
-    let mut exp_ab = [0u8; K];
-    let mut exp_lcm = [0u8; K];
 
-    let mut file = File::create("benchmark_output.csv").expect("Unable to create file");
-    writeln!(
-        file,
-        "bits,native_gcd_ns,pfs_gcd_ns,native_lcm_ns,pfs_lcm_ns"
-    )
-    .unwrap();
+    let mut bits = Vec::new();
+    let mut native_gcd_ns = Vec::new();
+    let mut pfs_gcd_ns = Vec::new();
+    let mut native_lcm_ns = Vec::new();
+    let mut pfs_lcm_ns = Vec::new();
 
-    let mut bits_vec = Vec::new();
-    let mut native_gcd_vec = Vec::new();
-    let mut pfs_gcd_vec = Vec::new();
-    let mut native_lcm_vec = Vec::new();
-    let mut pfs_lcm_vec = Vec::new();
-
-    for bits in 16..=64 {
-        let mut native_gcd = Duration::ZERO;
-        let mut pfs_gcd = Duration::ZERO;
-        let mut native_lcm_total = Duration::ZERO;
-        let mut pfs_lcm_total = Duration::ZERO;
-
-        let mask: u64 = if bits == 64 {
-            u64::MAX
-        } else {
-            (1u64 << bits) - 1
-        };
+    for exp in 4..=32 {
+        let max = 1u64 << exp;
+        let mut native_gcd_time = 0;
+        let mut pfs_gcd_time = 0;
+        let mut native_lcm_time = 0;
+        let mut pfs_lcm_time = 0;
 
         for _ in 0..TRIALS {
-            let raw_a: u64 = rng.r#gen::<u64>() & mask;
-            let raw_b: u64 = rng.r#gen::<u64>() & mask;
-            let a = raw_a.min(u32::MAX as u64) as u32;
-            let b = raw_b.min(u32::MAX as u64) as u32;
+            let x = rng.gen_range(1..max);
+            let y = rng.gen_range(1..max);
 
-            if a == 0 || b == 0 {
-                continue;
-            }
+            let now = Instant::now();
+            let g1 = binary_gcd(x, y);
+            native_gcd_time += now.elapsed().as_nanos();
 
-            // Native GCD & LCM
-            let start = Instant::now();
-            let g = gcd_euclid(a, b);
-            native_gcd += start.elapsed();
+            let now = Instant::now();
+            let (xf, xr) = factorize(x);
+            let (yf, yr) = factorize(y);
+            let gcd_rem = binary_gcd(xr, yr);
+            let g2 = pfs_to_u64(&simd_min(&xf, &yf)).saturating_mul(gcd_rem);
+            pfs_gcd_time += now.elapsed().as_nanos();
 
-            let start = Instant::now();
-            let _lcm = (a as u64 * b as u64) / g as u64;
-            native_lcm_total += start.elapsed();
+            let now = Instant::now();
+            let l1 = native_lcm(x, y);
+            native_lcm_time += now.elapsed().as_nanos();
 
-            // PFS GCD & LCM
-            let start = Instant::now();
-            let leftover_a = factor_to_array(a, &primes, &mut exp_a);
-            let leftover_b = factor_to_array(b, &primes, &mut exp_b);
-            simd_min(exp_a.as_ptr(), exp_b.as_ptr(), exp_g.as_mut_ptr());
-            let leftover_gcd = gcd_euclid(leftover_a, leftover_b);
-            let g2 = reconstruct_array(&exp_g, &primes, leftover_gcd);
-            pfs_gcd += start.elapsed();
+            let now = Instant::now();
+            let lcm_rem = native_lcm(xr, yr);
+            let l2 = pfs_to_u64(&simd_max(&xf, &yf)).saturating_mul(lcm_rem);
+            pfs_lcm_time += now.elapsed().as_nanos();
 
-            // Korrektheitsprüfung
-            if u64::from(g) != g2 {
-                eprintln!(
-                    "GCD mismatch: {} vs {}\na={} b={}\nexp_a={:?}\nexp_b={:?}\nleftover_a={} leftover_b={}\nprimes={:?}",
-                    g, g2, a, b, exp_a, exp_b, leftover_a, leftover_b, primes
-                );
-            }
-
-            simd_add(exp_a.as_ptr(), exp_b.as_ptr(), exp_ab.as_mut_ptr());
-            simd_sub(exp_ab.as_ptr(), exp_g.as_ptr(), exp_lcm.as_mut_ptr());
-
-            let start = Instant::now();
-            let _ = reconstruct_array(&exp_lcm, &primes, 1);
-            pfs_lcm_total += start.elapsed();
+            debug_assert_eq!(
+                g1, g2,
+                "GCD mismatch for x={} y={} => {} != {}",
+                x, y, g1, g2
+            );
+            debug_assert_eq!(
+                l1, l2,
+                "LCM mismatch for x={} y={} => {} != {}",
+                x, y, l1, l2
+            );
         }
 
-        let avg_native_gcd = native_gcd.as_nanos() / TRIALS as u128;
-        let avg_pfs_gcd = pfs_gcd.as_nanos() / TRIALS as u128;
-        let avg_native_lcm = native_lcm_total.as_nanos() / TRIALS as u128;
-        let avg_pfs_lcm = pfs_lcm_total.as_nanos() / TRIALS as u128;
+        bits.push(exp);
+        native_gcd_ns.push(native_gcd_time / TRIALS as u128);
+        pfs_gcd_ns.push(pfs_gcd_time / TRIALS as u128);
+        native_lcm_ns.push(native_lcm_time / TRIALS as u128);
+        pfs_lcm_ns.push(pfs_lcm_time / TRIALS as u128);
 
-        writeln!(
-            file,
-            "{},{},{},{},{}",
-            bits, avg_native_gcd, avg_pfs_gcd, avg_native_lcm, avg_pfs_lcm
-        )
-        .unwrap();
-
-        bits_vec.push(bits as u32);
-        native_gcd_vec.push(avg_native_gcd);
-        pfs_gcd_vec.push(avg_pfs_gcd);
-        native_lcm_vec.push(avg_native_lcm);
-        pfs_lcm_vec.push(avg_pfs_lcm);
-
-        println!(
-            "Bits: {}\tGCD native: {} ns\tPFS: {} ns\tLCM native: {} ns\tPFS: {} ns",
-            bits, avg_native_gcd, avg_pfs_gcd, avg_native_lcm, avg_pfs_lcm
-        );
+        println!("Processed {} bits", exp);
     }
 
-    println!("Done. Output written to benchmark_output.csv");
-
     let data = BenchmarkData {
-        bits: bits_vec,
-        native_gcd_ns: native_gcd_vec,
-        pfs_gcd_ns: pfs_gcd_vec,
-        native_lcm_ns: native_lcm_vec,
-        pfs_lcm_ns: pfs_lcm_vec,
+        bits,
+        native_gcd_ns,
+        pfs_gcd_ns,
+        native_lcm_ns,
+        pfs_lcm_ns,
     };
 
-    run_benchmark_gui(data)
+    let _ = run_benchmark_gui(data); // Result ignorieren wegen Warnung
 }
