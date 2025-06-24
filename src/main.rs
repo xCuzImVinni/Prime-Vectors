@@ -1,14 +1,19 @@
+//PFS := Prime Factorization System, native := the usual way
 use rand::Rng;
 use std::arch::x86_64::*;
 use std::fs::File;
-use std::io::{BufRead, BufReader, Write};
+use std::io::Write;
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 mod gui;
-use gui::{run_benchmark_gui, BenchmarkData};
+use gui::{BenchmarkData, run_benchmark_gui};
 
-const K: usize = 16; // first 16 primes
+const K: usize = 20; // Erhöht auf 20 Primzahlen
 const TRIALS: usize = 1000;
+const MAX_LUT: usize = 1 << 16; // 65536
+
+static FACTOR_LUT: OnceLock<Vec<([u8; K], u32)>> = OnceLock::new();
 
 fn first_k_primes(k: usize) -> Vec<u32> {
     let mut primes = Vec::new();
@@ -32,29 +37,68 @@ fn first_k_primes(k: usize) -> Vec<u32> {
     primes
 }
 
-fn factor_to_array(mut n: u32, primes: &[u32], exps: &mut [u8; K]) -> u32 {
-    *exps = [0u8; K];
-    for (i, &p) in primes.iter().enumerate() {
-        while n % p == 0 {
-            exps[i] = exps[i].wrapping_add(1);
-            n /= p;
+fn init_lookup_table(primes: &[u32]) {
+    let mut table = vec![([0u8; K], 0); MAX_LUT];
+    for n in 1..MAX_LUT {
+        let mut leftover = n as u32;
+        let mut exps = [0u8; K];
+
+        for (i, &p) in primes.iter().enumerate() {
+            while leftover % p == 0 {
+                exps[i] = exps[i].saturating_add(1);
+                leftover /= p;
+            }
         }
+        table[n] = (exps, leftover);
     }
-    n
+    FACTOR_LUT.set(table).unwrap();
+}
+
+fn factor_to_array(n: u32, primes: &[u32], exps: &mut [u8; K]) -> u32 {
+    if n < MAX_LUT as u32 {
+        let table = FACTOR_LUT.get().expect("LUT not initialized");
+        let (lookup_exp, leftover) = table[n as usize];
+        *exps = lookup_exp;
+        leftover
+    } else {
+        exps.iter_mut().for_each(|e| *e = 0);
+        let mut leftover = n;
+
+        // Faktorisierung für Primzahlen <= sqrt(n)
+        for (i, &p) in primes.iter().enumerate() {
+            if p * p > leftover {
+                break;
+            }
+            while leftover % p == 0 {
+                exps[i] = exps[i].saturating_add(1);
+                leftover /= p;
+            }
+        }
+
+        // Nachbearbeitung für große Primfaktoren
+        if leftover > 1 {
+            if let Some(pos) = primes.iter().position(|&prime| prime == leftover) {
+                exps[pos] = exps[pos].saturating_add(1);
+                leftover = 1;
+            }
+        }
+
+        leftover
+    }
 }
 
 fn reconstruct_array(exps: &[u8; K], primes: &[u32], leftover: u32) -> u64 {
     let mut res = leftover as u64;
     for i in 0..K {
-        let e = exps[i] as usize;
-        if e > 0 {
-            res *= (0..e).fold(1u64, |a, _| a * primes[i] as u64);
+        if exps[i] > 0 {
+            let p = primes[i] as u64;
+            res *= p.pow(exps[i] as u32);
         }
     }
     res
 }
 
-unsafe fn simd_min(a: *const u8, b: *const u8, out: *mut u8) {
+fn simd_min(a: *const u8, b: *const u8, out: *mut u8) {
     unsafe {
         let va = _mm_loadu_si128(a as *const __m128i);
         let vb = _mm_loadu_si128(b as *const __m128i);
@@ -62,7 +106,8 @@ unsafe fn simd_min(a: *const u8, b: *const u8, out: *mut u8) {
         _mm_storeu_si128(out as *mut __m128i, vc);
     }
 }
-unsafe fn simd_add(a: *const u8, b: *const u8, out: *mut u8) {
+
+fn simd_add(a: *const u8, b: *const u8, out: *mut u8) {
     unsafe {
         let va = _mm_loadu_si128(a as *const __m128i);
         let vb = _mm_loadu_si128(b as *const __m128i);
@@ -70,7 +115,8 @@ unsafe fn simd_add(a: *const u8, b: *const u8, out: *mut u8) {
         _mm_storeu_si128(out as *mut __m128i, vc);
     }
 }
-unsafe fn simd_sub(a: *const u8, b: *const u8, out: *mut u8) {
+
+fn simd_sub(a: *const u8, b: *const u8, out: *mut u8) {
     unsafe {
         let va = _mm_loadu_si128(a as *const __m128i);
         let vb = _mm_loadu_si128(b as *const __m128i);
@@ -81,49 +127,14 @@ unsafe fn simd_sub(a: *const u8, b: *const u8, out: *mut u8) {
 
 fn gcd_euclid(mut a: u32, mut b: u32) -> u32 {
     while b != 0 {
-        let t = b;
-        b = a % b;
-        a = t;
+        (a, b) = (b, a % b);
     }
     a
 }
 
-fn load_benchmark_data(filename: &str) -> Result<BenchmarkData, Box<dyn std::error::Error>> {
-    let file = File::open(filename)?;
-    let reader = BufReader::new(file);
-
-    let mut bits = Vec::new();
-    let mut native_gcd_ns = Vec::new();
-    let mut pfs_gcd_ns = Vec::new();
-    let mut native_lcm_ns = Vec::new();
-    let mut pfs_lcm_ns = Vec::new();
-
-    for (i, line) in reader.lines().enumerate() {
-        let line = line?;
-        if i == 0 {
-            continue; // Header überspringen
-        }
-        let cols: Vec<&str> = line.split(',').collect();
-        if cols.len() == 5 {
-            bits.push(cols[0].parse()?);
-            native_gcd_ns.push(cols[1].parse()?);
-            pfs_gcd_ns.push(cols[2].parse()?);
-            native_lcm_ns.push(cols[3].parse()?);
-            pfs_lcm_ns.push(cols[4].parse()?);
-        }
-    }
-
-    Ok(BenchmarkData {
-        bits,
-        native_gcd_ns,
-        pfs_gcd_ns,
-        native_lcm_ns,
-        pfs_lcm_ns,
-    })
-}
-
 fn main() -> Result<(), eframe::Error> {
     let primes = first_k_primes(K);
+    init_lookup_table(&primes);
     let mut rng = rand::thread_rng();
     let mut exp_a = [0u8; K];
     let mut exp_b = [0u8; K];
@@ -138,7 +149,6 @@ fn main() -> Result<(), eframe::Error> {
     )
     .unwrap();
 
-    // Vektoren zum Speichern der Ergebnisse für die GUI
     let mut bits_vec = Vec::new();
     let mut native_gcd_vec = Vec::new();
     let mut pfs_gcd_vec = Vec::new();
@@ -158,9 +168,8 @@ fn main() -> Result<(), eframe::Error> {
         };
 
         for _ in 0..TRIALS {
-            // ✅ Korrekte Verwendung von rng.gen::<u64>()
-            let raw_a: u64 = rng.gen::<u64>() & mask;
-            let raw_b: u64 = rng.gen::<u64>() & mask;
+            let raw_a: u64 = rng.r#gen::<u64>() & mask;
+            let raw_b: u64 = rng.r#gen::<u64>() & mask;
             let a = raw_a.min(u32::MAX as u64) as u32;
             let b = raw_b.min(u32::MAX as u64) as u32;
 
@@ -168,27 +177,35 @@ fn main() -> Result<(), eframe::Error> {
                 continue;
             }
 
+            // Native GCD & LCM
             let start = Instant::now();
             let g = gcd_euclid(a, b);
             native_gcd += start.elapsed();
 
             let start = Instant::now();
-            let _ = (a as u64 / g as u64) * b as u64;
+            let _lcm = (a as u64 * b as u64) / g as u64;
             native_lcm_total += start.elapsed();
 
-            let _ = factor_to_array(a, &primes, &mut exp_a);
-            let _ = factor_to_array(b, &primes, &mut exp_b);
-
+            // PFS GCD & LCM
             let start = Instant::now();
-            unsafe {
-                simd_min(exp_a.as_ptr(), exp_b.as_ptr(), exp_g.as_mut_ptr());
-            }
+            let leftover_a = factor_to_array(a, &primes, &mut exp_a);
+            let leftover_b = factor_to_array(b, &primes, &mut exp_b);
+            simd_min(exp_a.as_ptr(), exp_b.as_ptr(), exp_g.as_mut_ptr());
+            let leftover_gcd = gcd_euclid(leftover_a, leftover_b);
+            let g2 = reconstruct_array(&exp_g, &primes, leftover_gcd);
             pfs_gcd += start.elapsed();
 
-            unsafe {
-                simd_add(exp_a.as_ptr(), exp_b.as_ptr(), exp_ab.as_mut_ptr());
-                simd_sub(exp_ab.as_ptr(), exp_g.as_ptr(), exp_lcm.as_mut_ptr());
+            // Korrektheitsprüfung
+            if u64::from(g) != g2 {
+                eprintln!(
+                    "GCD mismatch: {} vs {}\na={} b={}\nexp_a={:?}\nexp_b={:?}\nleftover_a={} leftover_b={}\nprimes={:?}",
+                    g, g2, a, b, exp_a, exp_b, leftover_a, leftover_b, primes
+                );
             }
+
+            simd_add(exp_a.as_ptr(), exp_b.as_ptr(), exp_ab.as_mut_ptr());
+            simd_sub(exp_ab.as_ptr(), exp_g.as_ptr(), exp_lcm.as_mut_ptr());
+
             let start = Instant::now();
             let _ = reconstruct_array(&exp_lcm, &primes, 1);
             pfs_lcm_total += start.elapsed();
@@ -216,11 +233,10 @@ fn main() -> Result<(), eframe::Error> {
             "Bits: {}\tGCD native: {} ns\tPFS: {} ns\tLCM native: {} ns\tPFS: {} ns",
             bits, avg_native_gcd, avg_pfs_gcd, avg_native_lcm, avg_pfs_lcm
         );
-    } // 👈 diese Klammer hat bei dir gefehlt!
+    }
 
     println!("Done. Output written to benchmark_output.csv");
 
-    // Daten für GUI aufbereiten
     let data = BenchmarkData {
         bits: bits_vec,
         native_gcd_ns: native_gcd_vec,
