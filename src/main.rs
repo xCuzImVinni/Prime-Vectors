@@ -11,7 +11,7 @@ use gui::{BenchmarkData, run_benchmark_gui};
 
 const K: usize = 16;
 const TRIALS: usize = 1000;
-const MAX_LUT: usize = 1 << 20; // 1 Million Einträge (~20 MB Speicher)
+const MAX_LUT: usize = 1 << 16;
 
 static PRIMES: OnceLock<Vec<u32>> = OnceLock::new();
 static FACTOR_LUT: OnceLock<Box<[([u8; K], u32)]>> = OnceLock::new();
@@ -25,11 +25,9 @@ fn binary_gcd(mut a: u64, mut b: u64) -> u64 {
     if b == 0 {
         return a;
     }
-
     let shift = a.trailing_zeros().min(b.trailing_zeros());
     a >>= a.trailing_zeros();
     b >>= b.trailing_zeros();
-
     while a != b {
         if a > b {
             a -= b;
@@ -45,6 +43,30 @@ fn binary_gcd(mut a: u64, mut b: u64) -> u64 {
 #[inline(always)]
 fn native_lcm(a: u64, b: u64) -> u64 {
     a / binary_gcd(a, b) * b
+}
+
+#[inline(always)]
+fn pure_pfs_lcm(xf: [u8; K], yf: [u8; K]) -> u64 {
+    // LCM über PFS: lcm = Produkt der Maximalexponenten
+    let f_max = u8x16::from_array(xf)
+        .simd_max(u8x16::from_array(yf))
+        .to_array();
+    pfs_to_u64(&f_max)
+}
+
+#[inline(always)]
+fn hybrid_pfs_lcm(xf: [u8; K], xr: u64, yf: [u8; K], yr: u64) -> u64 {
+    // hybrid LCM = pure LCM * lcm von Resten (GCD auf Resten), da restliche Primfaktoren nicht im LUT
+    let f_max = u8x16::from_array(xf)
+        .simd_max(u8x16::from_array(yf))
+        .to_array();
+    let base = pfs_to_u64(&f_max);
+
+    if xr == 1 && yr == 1 {
+        base
+    } else {
+        base.saturating_mul(native_lcm(xr, yr))
+    }
 }
 
 fn first_k_primes(k: usize) -> Vec<u32> {
@@ -64,10 +86,8 @@ fn first_k_primes(k: usize) -> Vec<u32> {
 }
 
 fn init_lookup_table() -> Box<[([u8; K], u32)]> {
-    let primes = PRIMES.get().expect("PRIMES not initialized");
-
+    let primes = PRIMES.get().unwrap();
     let mut table = vec![([0u8; K], 1); MAX_LUT];
-
     table
         .par_iter_mut()
         .enumerate()
@@ -84,14 +104,12 @@ fn init_lookup_table() -> Box<[([u8; K], u32)]> {
             }
             *entry = (factor_counts, n as u32);
         });
-
     table.into_boxed_slice()
 }
 
 fn init_power_table() -> [[u64; 64]; K] {
     let primes = PRIMES.get().unwrap();
     let mut table = [[1u64; 64]; K];
-
     for i in 0..K {
         let mut acc = 1u64;
         let p = primes[i] as u64;
@@ -117,24 +135,18 @@ fn factorize(n: u64) -> Option<([u8; K], u64)> {
         let primes = PRIMES.get().unwrap();
         let mut exponents = [0u8; K];
         let mut rem = n;
-
         for (i, &p) in primes.iter().enumerate() {
             let p64 = p as u64;
-            if p64 > rem {
+            if p64 > rem || p64 * p64 > rem {
                 break;
             }
-            if p64 * p64 > rem {
-                break;
-            }
-
             while rem % p64 == 0 {
                 exponents[i] += 1;
                 rem /= p64;
             }
         }
-
         if rem > 1 {
-            None // nicht vollständig faktorisierbar
+            None
         } else {
             Some((exponents, rem))
         }
@@ -145,8 +157,6 @@ fn factorize(n: u64) -> Option<([u8; K], u64)> {
 fn pfs_to_u64(factors: &[u8; K]) -> u64 {
     let power_table = unsafe { POWER_TABLE.get().unwrap_unchecked() };
     let mut result = 1u64;
-
-    // Statt saturating_mul, wenn Überlauf ausgeschlossen
     for i in 0..K {
         unsafe {
             let exponent = *factors.get_unchecked(i) as usize;
@@ -157,26 +167,53 @@ fn pfs_to_u64(factors: &[u8; K]) -> u64 {
     result
 }
 
+#[inline(always)]
+fn pure_pfs_gcd(xf: [u8; K], yf: [u8; K]) -> u64 {
+    let f_min = u8x16::from_array(xf)
+        .simd_min(u8x16::from_array(yf))
+        .to_array();
+    pfs_to_u64(&f_min)
+}
+
+#[inline(always)]
+fn hybrid_pfs_gcd(xf: [u8; K], xr: u64, yf: [u8; K], yr: u64) -> u64 {
+    let f_min = u8x16::from_array(xf)
+        .simd_min(u8x16::from_array(yf))
+        .to_array();
+
+    let base = pfs_to_u64(&f_min);
+    if xr == 1 && yr == 1 {
+        base
+    } else {
+        base.saturating_mul(binary_gcd(xr, yr))
+    }
+}
+
 fn main() {
     PRIMES.set(first_k_primes(K)).unwrap();
     FACTOR_LUT.get_or_init(init_lookup_table);
     POWER_TABLE.get_or_init(init_power_table);
 
+    let lut_mem = std::mem::size_of_val(&**FACTOR_LUT.get().unwrap()) as u64;
+    let power_table_mem = std::mem::size_of_val(POWER_TABLE.get().unwrap()) as u64;
+    let primes_mem = PRIMES.get().unwrap().capacity() as u64 * std::mem::size_of::<u32>() as u64;
+
     let mut bits = Vec::new();
     let mut native_gcd_ns = Vec::new();
-    let mut pfs_gcd_ns = Vec::new();
+    let mut hybrid_gcd_ns = Vec::new();
+    let mut pure_gcd_ns = Vec::new();
     let mut native_lcm_ns = Vec::new();
-    let mut pfs_lcm_ns = Vec::new();
+    let mut hybrid_lcm_ns = Vec::new();
+    let mut pure_lcm_ns = Vec::new();
+
+    let mut total_iterations = 0u64;
+    let mut pure_gcd_hits = 0u64;
+    let mut pure_lcm_hits = 0u64;
 
     for exp in 4..=32 {
         let max = (1 << exp).min(MAX_LUT as u64);
-        let mut native_gcd_time = 0;
-        let mut pfs_gcd_time = 0;
-        let mut native_lcm_time = 0;
-        let mut pfs_lcm_time = 0;
 
-        // Parallele Verarbeitung der Versuche
-
+        // Parallele Berechnung mit thread-lokalen Zählern
         let results: Vec<_> = (0..TRIALS)
             .into_par_iter()
             .map_init(
@@ -185,77 +222,146 @@ fn main() {
                     let x = rng.gen_range(1..max);
                     let y = rng.gen_range(1..max);
 
-                    // Native GCD
                     let now = Instant::now();
-                    let g1 = binary_gcd(x, y);
-                    let t_native_gcd = now.elapsed().as_nanos();
+                    let g_native = binary_gcd(x, y);
+                    let t_native = now.elapsed().as_nanos();
 
-                    // --- PFS GCD ---
                     if let (Some((xf, xr)), Some((yf, yr))) = (factorize(x), factorize(y)) {
+                        // Hybrid GCD
                         let now = Instant::now();
-                        let gcd_rem = binary_gcd(xr, yr);
+                        let g_hybrid = hybrid_pfs_gcd(xf, xr, yf, yr);
+                        let t_hybrid = now.elapsed().as_nanos();
 
-                        let f_min = u8x16::from_array(xf)
-                            .simd_min(u8x16::from_array(yf))
-                            .to_array();
-                        let g2 = pfs_to_u64(&f_min).saturating_mul(gcd_rem);
-                        let t_pfs_gcd = now.elapsed().as_nanos();
-
-                        // --- Native LCM ---
+                        // Pure GCD
                         let now = Instant::now();
-                        let l1 = native_lcm(x, y);
+                        let g_pure = pure_pfs_gcd(xf, yf);
+                        let t_pure = now.elapsed().as_nanos();
+
+                        // Native LCM
+                        let now = Instant::now();
+                        let l_native = native_lcm(x, y);
                         let t_native_lcm = now.elapsed().as_nanos();
 
-                        // --- PFS LCM ---
+                        // Hybrid LCM
                         let now = Instant::now();
-                        let lcm_rem = native_lcm(xr, yr);
-                        let f_max = u8x16::from_array(xf)
-                            .simd_max(u8x16::from_array(yf))
-                            .to_array();
-                        let l2 = pfs_to_u64(&f_max).saturating_mul(lcm_rem);
-                        let t_pfs_lcm = now.elapsed().as_nanos();
+                        let l_hybrid = hybrid_pfs_lcm(xf, xr, yf, yr);
+                        let t_hybrid_lcm = now.elapsed().as_nanos();
 
-                        assert_eq!(g1, g2, "GCD mismatch: {} vs {} (x={}, y={})", g1, g2, x, y);
-                        assert_eq!(l1, l2, "LCM mismatch: {} vs {} (x={}, y={})", l1, l2, x, y);
+                        // Pure LCM
+                        let now = Instant::now();
+                        let l_pure = pure_pfs_lcm(xf, yf);
+                        let t_pure_lcm = now.elapsed().as_nanos();
 
-                        Some((t_native_gcd, t_pfs_gcd, t_native_lcm, t_pfs_lcm))
+                        // Sanity Checks
+                        assert_eq!(
+                            l_native, l_hybrid,
+                            "Hybrid LCM mismatch for x = {}, y = {}",
+                            x, y
+                        );
+                        assert_eq!(
+                            g_native, g_hybrid,
+                            "Hybrid GCD mismatch for x = {}, y = {}",
+                            x, y
+                        );
+
+                        let mut pure_gcd_hit = 0u64;
+                        let mut pure_lcm_hit = 0u64;
+
+                        if xr == 1 && yr == 1 {
+                            assert_eq!(
+                                l_native, l_pure,
+                                "Pure LCM mismatch for x = {}, y = {}",
+                                x, y
+                            );
+                            assert_eq!(
+                                g_native, g_pure,
+                                "Pure GCD mismatch for x = {}, y = {}",
+                                x, y
+                            );
+
+                            pure_gcd_hit = 1;
+                            pure_lcm_hit = 1;
+                        }
+
+                        Some((
+                            t_native,
+                            t_hybrid,
+                            t_pure,
+                            t_native_lcm,
+                            t_hybrid_lcm,
+                            t_pure_lcm,
+                            pure_gcd_hit,
+                            pure_lcm_hit,
+                        ))
                     } else {
-                        None // Zahlen nicht vollständig faktorisierbar
+                        None
                     }
                 },
             )
-            .filter_map(|x| x) // nur gültige Ergebnisse weiterverarbeiten
+            .filter_map(|x| x)
             .collect();
-        // Aggregation der Ergebnisse
-        for (t_native_gcd, t_pfs_gcd, t_native_lcm, t_pfs_lcm) in results {
-            native_gcd_time += t_native_gcd;
-            pfs_gcd_time += t_pfs_gcd;
-            native_lcm_time += t_native_lcm;
-            pfs_lcm_time += t_pfs_lcm;
+
+        // Summieren der Ergebnisse und Treffer
+        let mut native_sum = 0u128;
+        let mut hybrid_sum = 0u128;
+        let mut pure_sum = 0u128;
+        let mut native_lcm_sum = 0u128;
+        let mut hybrid_lcm_sum = 0u128;
+        let mut pure_lcm_sum = 0u128;
+        let mut gcd_hits_sum = 0u64;
+        let mut lcm_hits_sum = 0u64;
+
+        for (
+            t_native,
+            t_hybrid,
+            t_pure,
+            t_native_lcm,
+            t_hybrid_lcm,
+            t_pure_lcm,
+            gcd_hit,
+            lcm_hit,
+        ) in &results
+        {
+            native_sum += *t_native;
+            hybrid_sum += *t_hybrid;
+            pure_sum += *t_pure;
+
+            native_lcm_sum += *t_native_lcm;
+            hybrid_lcm_sum += *t_hybrid_lcm;
+            pure_lcm_sum += *t_pure_lcm;
+
+            gcd_hits_sum += *gcd_hit;
+            lcm_hits_sum += *lcm_hit;
         }
 
         bits.push(exp);
-        native_gcd_ns.push(native_gcd_time / TRIALS as u128);
-        pfs_gcd_ns.push(pfs_gcd_time / TRIALS as u128);
-        native_lcm_ns.push(native_lcm_time / TRIALS as u128);
-        pfs_lcm_ns.push(pfs_lcm_time / TRIALS as u128);
+        native_gcd_ns.push(native_sum / TRIALS as u128);
+        hybrid_gcd_ns.push(hybrid_sum / TRIALS as u128);
+        pure_gcd_ns.push(pure_sum / TRIALS as u128);
 
-        println!(
-            "Bits: {:2} | GCD: {:6}ns (PFS) vs {:6}ns (Native) | LCM: {:6}ns (PFS) vs {:6}ns (Native)",
-            exp,
-            pfs_gcd_time / TRIALS as u128,
-            native_gcd_time / TRIALS as u128,
-            pfs_lcm_time / TRIALS as u128,
-            native_lcm_time / TRIALS as u128,
-        );
+        native_lcm_ns.push(native_lcm_sum / TRIALS as u128);
+        hybrid_lcm_ns.push(hybrid_lcm_sum / TRIALS as u128);
+        pure_lcm_ns.push(pure_lcm_sum / TRIALS as u128);
+
+        total_iterations += TRIALS as u64;
+        pure_gcd_hits += gcd_hits_sum;
+        pure_lcm_hits += lcm_hits_sum;
     }
 
     let data = BenchmarkData {
         bits,
         native_gcd_ns,
-        pfs_gcd_ns,
+        hybrid_gcd_ns,
+        pure_gcd_ns,
         native_lcm_ns,
-        pfs_lcm_ns,
+        hybrid_lcm_ns,
+        pure_lcm_ns,
+        lut_mem_kb: lut_mem / 1024,
+        power_table_mem_kb: power_table_mem / 1024,
+        primes_mem_kb: primes_mem / 1024,
+        total_iterations,
+        pure_gcd_hits,
+        pure_lcm_hits,
     };
 
     let _ = run_benchmark_gui(data);
