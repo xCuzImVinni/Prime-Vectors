@@ -1,7 +1,19 @@
+//! GCD/LCM Benchmarking with SIMD + Prime Factorization System (PFS)
+//!
+//! - Uses portable SIMD (nightly feature)
+//! - Compares native, hybrid, and pure PFS-based algorithms
+//! - Generates data for GUI visualization
+
 #![feature(portable_simd)]
+
+// Random number generation & parallelism
 use rand::{Rng, SeedableRng, rngs::StdRng};
 use rayon::prelude::*;
+
+// SIMD comparison
 use std::simd::{cmp::SimdOrd, u8x16};
+
+// Static global initialization
 use std::sync::OnceLock;
 use std::time::Instant;
 use sysinfo::{Pid, Process, System};
@@ -9,13 +21,19 @@ use sysinfo::{Pid, Process, System};
 mod gui;
 use gui::{BenchmarkData, run_benchmark_gui};
 
-const K: usize = 16;
-const TRIALS: usize = 1000;
-const MAX_LUT: usize = 1 << 16;
+// --- Configuration Constants ---
+
+const K: usize = 16; // Max number of primes used in factor vectors
+const TRIALS: usize = 1000; // Benchmark trials per bit size
+const MAX_LUT: usize = 1 << 16; // Max input supported by lookup table
+
+// --- Global Tables ---
 
 static PRIMES: OnceLock<Vec<u32>> = OnceLock::new();
 static FACTOR_LUT: OnceLock<Box<[([u8; K], u32)]>> = OnceLock::new();
 static POWER_TABLE: OnceLock<[[u64; 64]; K]> = OnceLock::new();
+
+// --- Native Reference Algorithms ---
 
 #[inline(always)]
 fn binary_gcd(mut a: u64, mut b: u64) -> u64 {
@@ -45,9 +63,11 @@ fn native_lcm(a: u64, b: u64) -> u64 {
     a / binary_gcd(a, b) * b
 }
 
+// --- PFS LCM Algorithms ---
+
 #[inline(always)]
 fn pure_pfs_lcm(xf: [u8; K], yf: [u8; K]) -> u64 {
-    // LCM über PFS: lcm = Produkt der Maximalexponenten
+    // Computes LCM using max exponents in factor vectors
     let f_max = u8x16::from_array(xf)
         .simd_max(u8x16::from_array(yf))
         .to_array();
@@ -56,7 +76,7 @@ fn pure_pfs_lcm(xf: [u8; K], yf: [u8; K]) -> u64 {
 
 #[inline(always)]
 fn hybrid_pfs_lcm(xf: [u8; K], xr: u64, yf: [u8; K], yr: u64) -> u64 {
-    // hybrid LCM = pure LCM * lcm von Resten (GCD auf Resten), da restliche Primfaktoren nicht im LUT
+    // Combines PFS-based LCM with native LCM on prime residues
     let f_max = u8x16::from_array(xf)
         .simd_max(u8x16::from_array(yf))
         .to_array();
@@ -68,6 +88,8 @@ fn hybrid_pfs_lcm(xf: [u8; K], xr: u64, yf: [u8; K], yr: u64) -> u64 {
         base.saturating_mul(native_lcm(xr, yr))
     }
 }
+
+// --- Initialization of Prime Tables ---
 
 fn first_k_primes(k: usize) -> Vec<u32> {
     let mut primes = Vec::with_capacity(k);
@@ -86,6 +108,7 @@ fn first_k_primes(k: usize) -> Vec<u32> {
 }
 
 fn init_lookup_table() -> Box<[([u8; K], u32)]> {
+    // Precomputes prime factor vectors and remainders
     let primes = PRIMES.get().unwrap();
     let mut table = vec![([0u8; K], 1); MAX_LUT];
     table
@@ -121,8 +144,11 @@ fn init_power_table() -> [[u64; 64]; K] {
     table
 }
 
+// --- Conversion and Factorization Functions ---
+
 #[inline(always)]
 fn factorize(n: u64) -> Option<([u8; K], u64)> {
+    // Returns (exponents, remaining prime factor) if fully factorizable
     if n < MAX_LUT as u64 {
         let (f, r) = unsafe {
             FACTOR_LUT
@@ -155,6 +181,7 @@ fn factorize(n: u64) -> Option<([u8; K], u64)> {
 
 #[inline(always)]
 fn pfs_to_u64(factors: &[u8; K]) -> u64 {
+    // Converts prime factor vector back to u64
     let power_table = unsafe { POWER_TABLE.get().unwrap_unchecked() };
     let mut result = 1u64;
     for i in 0..K {
@@ -166,6 +193,8 @@ fn pfs_to_u64(factors: &[u8; K]) -> u64 {
     }
     result
 }
+
+// --- PFS GCD Algorithms ---
 
 #[inline(always)]
 fn pure_pfs_gcd(xf: [u8; K], yf: [u8; K]) -> u64 {
@@ -180,7 +209,6 @@ fn hybrid_pfs_gcd(xf: [u8; K], xr: u64, yf: [u8; K], yr: u64) -> u64 {
     let f_min = u8x16::from_array(xf)
         .simd_min(u8x16::from_array(yf))
         .to_array();
-
     let base = pfs_to_u64(&f_min);
     if xr == 1 && yr == 1 {
         base
@@ -189,15 +217,20 @@ fn hybrid_pfs_gcd(xf: [u8; K], xr: u64, yf: [u8; K], yr: u64) -> u64 {
     }
 }
 
+// --- Benchmark Entry Point ---
+
 fn main() {
+    // Initialize all static tables
     PRIMES.set(first_k_primes(K)).unwrap();
     FACTOR_LUT.get_or_init(init_lookup_table);
     POWER_TABLE.get_or_init(init_power_table);
 
+    // Measure memory usage
     let lut_mem = std::mem::size_of_val(&**FACTOR_LUT.get().unwrap()) as u64;
     let power_table_mem = std::mem::size_of_val(POWER_TABLE.get().unwrap()) as u64;
     let primes_mem = PRIMES.get().unwrap().capacity() as u64 * std::mem::size_of::<u32>() as u64;
 
+    // Output vectors
     let mut bits = Vec::new();
     let mut native_gcd_ns = Vec::new();
     let mut hybrid_gcd_ns = Vec::new();
@@ -210,10 +243,11 @@ fn main() {
     let mut pure_gcd_hits = 0u64;
     let mut pure_lcm_hits = 0u64;
 
+    // Loop through bit widths
     for exp in 4..=32 {
         let max = (1 << exp).min(MAX_LUT as u64);
 
-        // Parallele Berechnung mit thread-lokalen Zählern
+        // Generate benchmark results in parallel
         let results: Vec<_> = (0..TRIALS)
             .into_par_iter()
             .map_init(
@@ -227,58 +261,36 @@ fn main() {
                     let t_native = now.elapsed().as_nanos();
 
                     if let (Some((xf, xr)), Some((yf, yr))) = (factorize(x), factorize(y)) {
-                        // Hybrid GCD
                         let now = Instant::now();
                         let g_hybrid = hybrid_pfs_gcd(xf, xr, yf, yr);
                         let t_hybrid = now.elapsed().as_nanos();
 
-                        // Pure GCD
                         let now = Instant::now();
                         let g_pure = pure_pfs_gcd(xf, yf);
                         let t_pure = now.elapsed().as_nanos();
 
-                        // Native LCM
                         let now = Instant::now();
                         let l_native = native_lcm(x, y);
                         let t_native_lcm = now.elapsed().as_nanos();
 
-                        // Hybrid LCM
                         let now = Instant::now();
                         let l_hybrid = hybrid_pfs_lcm(xf, xr, yf, yr);
                         let t_hybrid_lcm = now.elapsed().as_nanos();
 
-                        // Pure LCM
                         let now = Instant::now();
                         let l_pure = pure_pfs_lcm(xf, yf);
                         let t_pure_lcm = now.elapsed().as_nanos();
 
-                        // Sanity Checks
-                        assert_eq!(
-                            l_native, l_hybrid,
-                            "Hybrid LCM mismatch for x = {}, y = {}",
-                            x, y
-                        );
-                        assert_eq!(
-                            g_native, g_hybrid,
-                            "Hybrid GCD mismatch for x = {}, y = {}",
-                            x, y
-                        );
+                        // Sanity checks
+                        assert_eq!(l_native, l_hybrid);
+                        assert_eq!(g_native, g_hybrid);
 
-                        let mut pure_gcd_hit = 0u64;
-                        let mut pure_lcm_hit = 0u64;
+                        let mut pure_gcd_hit = 0;
+                        let mut pure_lcm_hit = 0;
 
                         if xr == 1 && yr == 1 {
-                            assert_eq!(
-                                l_native, l_pure,
-                                "Pure LCM mismatch for x = {}, y = {}",
-                                x, y
-                            );
-                            assert_eq!(
-                                g_native, g_pure,
-                                "Pure GCD mismatch for x = {}, y = {}",
-                                x, y
-                            );
-
+                            assert_eq!(l_native, l_pure);
+                            assert_eq!(g_native, g_pure);
                             pure_gcd_hit = 1;
                             pure_lcm_hit = 1;
                         }
@@ -301,15 +313,15 @@ fn main() {
             .filter_map(|x| x)
             .collect();
 
-        // Summieren der Ergebnisse und Treffer
-        let mut native_sum = 0u128;
-        let mut hybrid_sum = 0u128;
-        let mut pure_sum = 0u128;
-        let mut native_lcm_sum = 0u128;
-        let mut hybrid_lcm_sum = 0u128;
-        let mut pure_lcm_sum = 0u128;
-        let mut gcd_hits_sum = 0u64;
-        let mut lcm_hits_sum = 0u64;
+        // Aggregate benchmark results
+        let mut native_sum = 0;
+        let mut hybrid_sum = 0;
+        let mut pure_sum = 0;
+        let mut native_lcm_sum = 0;
+        let mut hybrid_lcm_sum = 0;
+        let mut pure_lcm_sum = 0;
+        let mut gcd_hits_sum = 0;
+        let mut lcm_hits_sum = 0;
 
         for (
             t_native,
