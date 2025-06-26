@@ -54,7 +54,3 @@ The main goals of the project were to:
 * Visualize empirical performance data in a clean and interactive GUI
 
 The most significant bottleneck remains **conversion overhead**: the need to factor numbers to enter or exit PFS form. If this step could be eliminated or greatly accelerated, PFS would become a strong candidate for replacing traditional arithmetic in niche performance-critical applications.
-
----
-
-Let me know if you want an academic-style abstract, a readme-ready markdown version, or a paper-style structure for publication or submission (like Jugend forscht, etc.).
