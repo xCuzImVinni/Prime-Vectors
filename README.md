@@ -1,7 +1,4 @@
 # Prime-Vectors
-Hier ist eine deutlich überarbeitete und professionellere Version deiner Projektbeschreibung auf Englisch. Sie ist präziser, grammatikalisch korrekt und erklärt die Motivation und das Ziel deines Projekts technisch klar:
-
----
 
 ## Project Documentation – Prime Factor Arithmetic System (PFS)
 
