@@ -3,7 +3,7 @@ Hier ist eine deutlich überarbeitete und professionellere Version deiner Projek
 
 ---
 
-## 📘 Project Documentation – Prime Factor Arithmetic System (PFS)
+## Project Documentation – Prime Factor Arithmetic System (PFS)
 
 ### Overview
 
